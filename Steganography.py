@@ -1,175 +1,119 @@
 import cv2
 import numpy as np
 from cryptography.fernet import Fernet
-
-# --- Edge-Based LSB Steganography Functions ---
-
-def text_to_binary(text):
-    binary = ''.join(format(ord(i), '08b') for i in text)
-    return binary
-
-def binary_to_text(binary):
-    bytes_list = [binary[i:i+8] for i in range(0, len(binary), 8)]
-    text = ''.join(chr(int(byte, 2)) for byte in bytes_list if byte != '')
-    return text
-
-def detect_edges(image, low_threshold=50, high_threshold=150):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, low_threshold, high_threshold)
-    return edges
-
-def get_edge_positions(edges):
-    y, x = np.where(edges != 0)
-    return list(zip(y, x))
-
-def embed_edge_message(cover_path, message, output_path, low_threshold=50, high_threshold=150):
-    cover_image = cv2.imread(cover_path)
-    if cover_image is None:
-        raise ValueError("Failed to load cover image")
-    
-    binary_message = text_to_binary(message)
-    total_bits = len(binary_message)
-    
-    edges = detect_edges(cover_image, low_threshold, high_threshold)
-    edge_positions = get_edge_positions(edges)
-    
-    capacity = len(edge_positions) * 3
-    if total_bits > capacity:
-        raise ValueError("Message too long for the cover image")
-    
-    stego_image = cover_image.copy()
-    msg_idx = 0
-    for y, x in edge_positions:
-        if msg_idx >= total_bits:
-            break
-        for channel in range(3):
-            if msg_idx >= total_bits:
-                break
-            pixel = stego_image[y, x, channel]
-            bit = int(binary_message[msg_idx])
-            stego_image[y, x, channel] = (pixel & 0xFE) | bit
-            msg_idx += 1
-    
-    cv2.imwrite(output_path, stego_image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
-    print(f"Edge-based stego image saved as {output_path}")
-    return total_bits
-
-def extract_edge_message(stego_path, total_bits, low_threshold=50, high_threshold=150):
-    stego_image = cv2.imread(stego_path)
-    if stego_image is None:
-        raise ValueError("Failed to load stego image")
-    
-    edges = detect_edges(stego_image, low_threshold, high_threshold)
-    edge_positions = get_edge_positions(edges)
-    
-    extracted_bits = ''
-    bit_count = 0
-    for y, x in edge_positions:
-        for channel in range(3):
-            if bit_count >= total_bits:
-                break
-            pixel = stego_image[y, x, channel]
-            lsb = pixel & 1
-            extracted_bits += str(lsb)
-            bit_count += 1
-        if bit_count >= total_bits:
-            break
-    
-    message = binary_to_text(extracted_bits[:total_bits])
-    return message
-
-# --- Multi-Level Steganography (MLS) Functions ---
-
+import hashlib
 def generate_key():
     return Fernet.generate_key()
+def encrypt_data(data, key):
+    return Fernet(key).encrypt(data)
+def decrypt_data(data, key):
+    return Fernet(key).decrypt(data)
+def encode_image(cover_path, message_path, output_path, n, key):
+    cover = cv2.imread(cover_path)
+    message = cv2.imread(message_path)
+    if cover is None or message is None:
+        raise ValueError("Image loading failed.")
 
-def encrypt_message(message, key):
-    f = Fernet(key)
-    return f.encrypt(message.encode())
+    message_flat = message.ravel()
+    encrypted_bytes = encrypt_data(message_flat.tobytes(), key)
+    binary_message = ''.join(f"{b:08b}" for b in encrypted_bytes)
+    total_bits = len(binary_message)
 
-def decrypt_message(encrypted_message, key):
-    f = Fernet(key)
-    return f.decrypt(encrypted_message).decode()
+    flat_cover = cover.ravel()
+    if total_bits > flat_cover.size * n:
+        raise ValueError("Cover image too small.")
+   #  print(f"Encrypted length: {len(encrypted_bytes)} bytes") #debug
+    # Generate consistent shuffle
+    seed = int(hashlib.sha256(key).hexdigest(), 16) % (2**32)
+    np.random.seed(seed)
+    indices = np.random.permutation(flat_cover.size)[:(total_bits + n - 1) // n]
 
-def randomize_pixels(image):
-    height, width, _ = image.shape
-    pixels = np.arange(height * width).reshape(height, width)
-    np.random.shuffle(pixels.ravel())
-    return pixels
+    # Vectorized bit chunk conversion
+    bit_chunks = np.array([
+        int(binary_message[i:i+n].ljust(n, '0'), 2)
+        for i in range(0, total_bits, n)
+    ], dtype=np.uint8)
 
-def mls_embed(cover_path, message, output_path, key):
-    cover_image = cv2.imread(cover_path)
-    if cover_image is None:
-        raise ValueError("Failed to load cover image")
-    
-    encrypted_message = encrypt_message(message, key)
-    binary_message = ''.join(format(byte, '08b') for byte in encrypted_message)
-    
-    randomized_pixels = randomize_pixels(cover_image)
-    flat_image = cover_image.reshape(-1, 3)
-    
-    msg_idx = 0
-    for i in range(len(flat_image)):
-        for c in range(3):
-            if msg_idx < len(binary_message):
-                bit = int(binary_message[msg_idx])
-                flat_image[i][c] = (flat_image[i][c] & 0xFE) | bit
-                msg_idx += 1
-            else:
-                break
-        if msg_idx >= len(binary_message):
-            break
-    
-    stego_image = flat_image.reshape(cover_image.shape)
-    cv2.imwrite(output_path, stego_image, [cv2.IMWRITE_PNG_COMPRESSION, 0])
-    print(f"MLS stego image saved as {output_path}")
-    return len(binary_message)
+    # Embed bits
+    mask = 0xFF ^ ((1 << n) - 1)
+    flat_cover[indices] = (flat_cover[indices] & mask) | bit_chunks
 
-def mls_extract(stego_path, total_bits, key):
-    stego_image = cv2.imread(stego_path)
-    if stego_image is None:
-        raise ValueError("Failed to load stego image")
-    
-    flat_image = stego_image.reshape(-1, 3)
-    extracted_bits = ''
-    bit_count = 0
-    for i in range(len(flat_image)):
-        for c in range(3):
-            if bit_count >= total_bits:
-                break
-            lsb = flat_image[i][c] & 1
-            extracted_bits += str(lsb)
-            bit_count += 1
-        if bit_count >= total_bits:
-            break
-    
-    byte_length = total_bits // 8
-    binary_str = extracted_bits[:byte_length * 8]
-    bytes_list = [int(binary_str[i:i+8], 2) for i in range(0, len(binary_str), 8)]
-    encrypted_message = bytes(bytes_list)
-    message = decrypt_message(encrypted_message, key)
-    return message
+    stego = flat_cover.reshape(cover.shape)
+    cv2.imwrite(output_path, stego)
+    print(f"Stego-image saved as {output_path}")
+    return total_bits
 
-# Example usage
+def decode_image(stego_path, message_width, message_height, output_path, n, key, total_bits):
+    stego = cv2.imread(stego_path)
+    if stego is None:
+        raise ValueError("Failed to load stego image.")
+
+    flat = stego.ravel()
+    seed = int(hashlib.sha256(key).hexdigest(), 16) % (2**32)
+    np.random.seed(seed)
+    indices = np.random.permutation(flat.size)[:(total_bits + n - 1) // n]
+
+    # Extract bits fast
+    extracted = flat[indices] & ((1 << n) - 1)
+    bit_str = ''.join(f"{val:0{n}b}" for val in extracted)
+    bit_str = bit_str[:total_bits]
+
+   #  print(f"Extracted bits: {len(bit_str)} / Expected: {total_bits}") #debug
+
+    # Convert bits to bytes
+    byte_data = bytes(int(bit_str[i:i+8], 2) for i in range(0, total_bits, 8))
+    decrypted = decrypt_data(byte_data, key)
+
+    # Reconstruct image
+    flat_msg = np.frombuffer(decrypted, dtype=np.uint8)
+    expected = message_width * message_height * 3
+    if len(flat_msg) < expected:
+        print("[ERROR] Decrypted message too short.")
+        return
+
+    img = flat_msg[:expected].reshape((message_height, message_width, 3))
+    cv2.imwrite(output_path, img)
+    print(f"Decoded message saved as {output_path}")
+
+
 if __name__ == "__main__":
-    cover_path = r"C:\Users\vinay\OneDrive\Pictures\prince.jpg"  # Replace with your cover image path
-    message = "Hello, My password is Password @12345"
-    edge_output = "edge_stego.png"
-    mls_output = "mls_stego.png"
     
-    # Edge-Based Steganography
+    choice = input("Give me the cover image path: ")
+    cover_path = choice
+   #  cover_path = "rcb.jpg" //default cover
+    choice = input("Give me the message image path: ")
+    message_path = choice
+   #  message_path = "trophy.jpg"//default message
+    output_stego = "stego.png"
+    output_message = "decoded_message.png"
+    n = 4  # bits per channel, can change at any point of time later
+
+    message_img = cv2.imread(message_path)
+    if message_img is None:
+        raise ValueError("Can't read message image.")
+
+    mh, mw = message_img.shape[:2]
+    key = generate_key() # same key for both encoding and decoding
+    while True:
+      choice = input("Do you want to start encoding the message? (y/n/quit): ")
+      if choice.lower() in ["y","yes"]:
+          print("Encoding the message...")
+          break
+      elif choice.lower() in ["quit","exit"]:
+          print("Exiting.")
+          exit()
     try:
-        total_bits = embed_edge_message(cover_path, message, edge_output)
-        extracted = extract_edge_message(edge_output, total_bits)
-        print("Edge-Based Extracted message:", extracted)
+        total_bits = encode_image(cover_path, message_path, output_stego, n, key)
     except Exception as e:
-        print(f"Edge-Based Error: {e}")
-    
-    # MLS Steganography
+        print(f"[ERROR] Encoding failed: {e}")
+        exit()
+    choice = input("Do you want to decode the message? (y/n): ")
+    if not choice.lower() in ["y","yes"]:
+        print("Exiting without decoding.")
+        exit()
+    # Decode the message
+    print("Decoding the message...")
     try:
-        key = generate_key()
-        total_bits = mls_embed(cover_path, message, mls_output, key)
-        extracted = mls_extract(mls_output, total_bits, key)
-        print("MLS Extracted message:", extracted)
+        decode_image(output_stego, mw, mh, output_message, n, key, total_bits)
     except Exception as e:
-        print(f"MLS Error: {e}")
+        print(f"[ERROR] Decoding failed: {e}")
